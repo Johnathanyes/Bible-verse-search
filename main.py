@@ -1,19 +1,24 @@
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from sqlmodel import Field, Session, SQLModel, create_engine, select
+from sqlmodel import Field, Session, SQLModel, create_engine, select, func
+
+from contextlib import asynccontextmanager
+from table_classes import *
 
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-class niv(SQLModel, table=True):
-    book_id: int = Field(primary_key=True)
-    book: str
-    chapter: int = Field(primary_key=True)
-    verse: int = Field(primary_key=True)
-    text: str
+VERSION_TABLES = {
+    "niv": niv,
+    "kjv": kjv,
+    "esv": esv,
+    "nlt": nlt,
+    "nkjv": nkjv,
+    "nasb": nasb,
+}
 
 db_name = os.environ.get("DB_NAME")
 db_user = os.environ.get("DB_USER")
@@ -31,16 +36,22 @@ def get_session():
 
 SessionDep = Annotated[Session, Depends(get_session)]
 
-app = FastAPI()
-
-@app.on_event("startup")
-def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     create_db_and_tables()
+    yield
 
-@app.get("/niv/get_verse")
-async def root(session: SessionDep, book_name: str, chapter_num: int, verse_num: int):
-    statement = select(niv).where(
-        (niv.book == book_name) & (niv.chapter == chapter_num) & (niv.verse == verse_num)
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/{version}/get_verse")
+async def root(session: SessionDep, version: str, book_name: str, chapter_num: int, verse_num: int):
+    if version.lower() not in VERSION_TABLES:
+        return HTTPException(status_code=404, detail="Invalid Bible Version Name")
+
+    version_table = VERSION_TABLES[version.lower()]
+    book_name = book_name.capitalize()
+    statement = select(version_table).where(
+        (version_table.book == book_name) & (version_table.chapter == chapter_num) & (version_table.verse == verse_num)
     )
     result = session.exec(statement).first()  # Use `.first()` if you expect only one verse
     if not result:
@@ -54,4 +65,68 @@ async def root(session: SessionDep, book_name: str, chapter_num: int, verse_num:
     }
     return verse_object
 
+@app.get("/{version}/get_verses")
+async def get_verses(session: SessionDep, version: str, book_name: str, chapter_num: int, verse_start: int, verse_end: int):
+    if version.lower() not in VERSION_TABLES:
+        return HTTPException(status_code=404, detail="Invalid Bible Version Name")
+    
+    version_table = VERSION_TABLES[version.lower()]
+    book_name = book_name.capitalize()
+    # Query all verses in a single database call
+    statement = select(version_table).where(
+        (version_table.book == book_name) &
+        (version_table.chapter == chapter_num) &
+        (version_table.verse >= verse_start) &
+        (version_table.verse <= verse_end)
+    )
+    results = session.exec(statement).all()  # Fetch all matching verses
+
+    if not results:
+        raise HTTPException(status_code=404, detail=f'No verses found for {book_name} chapter {chapter_num}, verses {verse_start}-{verse_end}')
+    
+    # Convert results to JSON format
+    list_of_verses = [
+        {
+            "book_num": verse.book_id,
+            "book_name": verse.book,
+            "chapter_num": verse.chapter,
+            "verse_num": verse.verse,
+            "text": verse.text
+        }
+        for verse in results
+    ]
+
+    return {"verses": list_of_verses}
+
+@app.get("/{version}/get_chapter")
+async def get_chapter(session: SessionDep, version: str, book_name: str, chapter_num: int):
+    if version.lower() not in VERSION_TABLES:
+        return HTTPException(status_code=404, detail="Invalid Bible Version Name")
+    
+    version_table = VERSION_TABLES[version.lower()]
+    book_name = book_name.capitalize()
+    statement = select(version_table).where(
+        (version_table.book == book_name) &
+        (version_table.chapter == chapter_num)
+    )
+    result = session.exec(statement).all()
+    return_object = {
+        "chapter": result
+    }
+    return return_object
+
+@app.get("/{version}/get_random_verse")
+async def get_random_verse(session: SessionDep, version: str):
+    if version.lower() not in VERSION_TABLES:
+        return HTTPException(status_code=404, detail="Invalid Bible Version Name")
+    
+    version_table = VERSION_TABLES[version.lower()]
+    statement = select(version_table).order_by(
+        func.random()
+    )
+    result = session.exec(statement).first()
+    return_value = {
+        "random_verse": result
+    }
+    return return_value
 #http://127.0.0.1:8000/niv/get_verse?book_name=Genesis&chapter_num=1&verse_num=1
